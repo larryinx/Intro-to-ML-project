@@ -13,6 +13,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision.models import resnet50, ResNet50_Weights
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim import AdamW
+import timm
 
 from sklearn.preprocessing import normalize
 
@@ -45,12 +48,15 @@ def generate_embeddings():
     #  more info here: https://pytorch.org/vision/stable/models.html)
     # model = nn.Module()
     # model = torchvision.models.get_model("pytorch/vision", "resnet50", weights="IMAGENET1K_V2", pretained=True)
-    model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device)
+    model = timm.create_model("tf_efficientnet_b4_ns", pretrained=True, num_classes=0, global_pool="avg")
+    model = model.to(device)
     model = nn.Sequential(*list(model.children())[:-1])
     model.eval()
 
     embeddings = []
-    embedding_size = 2048 # Dummy variable, replace with the actual embedding size once you 
+    # embedding_size = 2048 # Dummy variable, replace with the actual embedding size once you 
+    embedding_size = 1792
+
     # pick your model
     num_images = len(train_dataset)
     embeddings = np.zeros((num_images, embedding_size))
@@ -62,6 +68,7 @@ def generate_embeddings():
             images = images.to(device)
             outputs = model(images)
             outputs = outputs.squeeze().cpu().numpy()
+            print(images, outputs)
             embeddings[i * train_loader.batch_size: (i + 1) * train_loader.batch_size] = outputs
 
     np.save('dataset/embeddings.npy', embeddings)
@@ -97,7 +104,7 @@ def get_data(file, train=True):
     y = []
     # use the individual embeddings to generate the features and labels for triplets
     for t in triplets:
-        emb = [file_to_embedding[a] for a in t.split()]
+        emb = [file_to_embedding['food\\'+a] for a in t.split()]
         X.append(np.hstack([emb[0], emb[1], emb[2]]))
         y.append(1)
         # Generating negative samples (data augmentation)
@@ -134,28 +141,49 @@ class Net(nn.Module):
     """
     The model class, which defines our classifier.
     """
+    # def __init__(self):
+    #     """
+    #     The constructor of the model.
+    #     """
+    #     super().__init__()
+    #     # self.fc1 = nn.Linear(3000, 1024)
+    #     self.fc1 = nn.Linear(6144, 2048)
+    #     self.fc2 = nn.Linear(2048, 1024)
+    #     self.fc3 = nn.Linear(1024, 512)
+    #     self.fc4 = nn.Linear(512, 1)
+
+    # def forward(self, x):
+    #     """
+    #     The forward pass of the model.
+
+    #     input: x: torch.Tensor, the input to the model
+
+    #     output: x: torch.Tensor, the output of the model
+    #     """
+    #     x = F.relu(self.fc1(x))
+    #     x = F.relu(self.fc2(x))
+    #     x = F.relu(self.fc3(x))
+    #     x = torch.sigmoid(self.fc4(x))
+    #     return x
     def __init__(self):
-        """
-        The constructor of the model.
-        """
         super().__init__()
-        self.fc1 = nn.Linear(3000, 1024)
-        self.fc2 = nn.Linear(1024, 512)
-        self.fc3 = nn.Linear(512, 1)
+        self.fc1 = nn.Linear(6144, 2048)
+        self.bn1 = nn.BatchNorm1d(2048)
+        self.fc2 = nn.Linear(2048, 1024)
+        self.bn2 = nn.BatchNorm1d(1024)
+        self.fc3 = nn.Linear(1024, 512)
+        self.bn3 = nn.BatchNorm1d(512)
+        self.fc4 = nn.Linear(512, 1)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
-        """
-        The forward pass of the model.
-
-        input: x: torch.Tensor, the input to the model
-
-        output: x: torch.Tensor, the output of the model
-        """
-        # x = self.fc(x)
-        # x = F.relu(x)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = torch.sigmoid(self.fc3(x))
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = self.dropout(x)
+        x = F.relu(self.bn2(self.fc2(x)))
+        x = self.dropout(x)
+        x = F.relu(self.bn3(self.fc3(x)))
+        x = self.dropout(x)
+        x = torch.sigmoid(self.fc4(x))
         return x
 
 def train_model(train_loader):
@@ -170,32 +198,36 @@ def train_model(train_loader):
     model = Net()
     model.train()
     model.to(device)
-    n_epochs = 10
+    n_epochs = 100 
+    patience = 10 
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
     # TODO: define a loss function, optimizer and proceed with training. Hint: use the part 
     # of the training data as a validation split. After each epoch, compute the loss on the 
     # validation split and print it out. This enables you to see how your model is performing 
     # on the validation data before submitting the results on the server. After choosing the 
     # best model, train it on the whole training data.
     criterion = nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = AdamW(model.parameters(), lr=0.001) 
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
-    # Split the training data into train and validation sets
     train_size = int(0.8 * len(train_loader.dataset))
     val_size = len(train_loader.dataset) - train_size
     train_set, val_set = random_split(train_loader.dataset, [train_size, val_size])
     train_loader = DataLoader(train_set, batch_size=train_loader.batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=train_loader.batch_size, shuffle=False)
 
-    for epoch in range(n_epochs):        
+    for epoch in range(n_epochs):    
+        train_loss = 0    
         for [X, y] in train_loader:
             X, y = X.to(device), y.to(device)
             optimizer.zero_grad()
             outputs = model(X)
             loss = criterion(outputs.squeeze(), y.float())
+            train_loss += loss.item()
             loss.backward()
             optimizer.step()
         
-        # Validate the model
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -206,8 +238,22 @@ def train_model(train_loader):
                 val_loss += loss.item()
         
         model.train()
-        print(f"Epoch {epoch+1}/{n_epochs}, Validation Loss: {val_loss/len(val_loader)}")
-    
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
+        print(f"Epoch {epoch+1}/{n_epochs}, Validation Loss: {val_loss}, Train Loss: {train_loss}")
+
+        # Update the learning rate scheduler
+        scheduler.step(val_loss)
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print("Early stopping triggered.")
+                break
 
     return model
 
